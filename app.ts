@@ -23,9 +23,7 @@ let requestSeq = 0;
 
 function writeReply(req: IncomingMessage, res: ServerResponse, reply: Reply): void {
   requestSeq += 1;
-  const body: Buffer = typeof reply.body === 'string' ? Buffer.from(reply.body, 'utf8') : reply.body;
   const headers: Record<string, string> = { ...(reply.headers ?? {}) };
-  if (headers['content-type'] === undefined && typeof reply.body === 'string') headers['content-type'] = JSON_TYPE;
   if (headers['link'] !== undefined) {
     const host = req.headers['host'];
     if (host !== undefined && host !== '') {
@@ -33,21 +31,29 @@ function writeReply(req: IncomingMessage, res: ServerResponse, reply: Reply): vo
     }
   }
   headers['x-github-request-id'] = `forge-${requestSeq}`;
-  headers['content-length'] = String(body.length);
+  if (typeof reply.body === 'string') {
+    // Hand the string straight to the socket: no intermediate Buffer copy per reply.
+    if (headers['content-type'] === undefined) headers['content-type'] = JSON_TYPE;
+    headers['content-length'] = String(Buffer.byteLength(reply.body, 'utf8'));
+    res.writeHead(reply.status, headers);
+    res.end(reply.body, 'utf8');
+    return;
+  }
+  headers['content-length'] = String(reply.body.length);
   res.writeHead(reply.status, headers);
-  res.end(body);
+  res.end(reply.body);
 }
 
 function jsonReply(status: number, value: unknown): Reply {
   return { status, body: `${JSON.stringify(value)}\n` };
 }
 
-function urlOf(req: IncomingMessage): URL {
-  try {
-    return new URL(req.url ?? '/', 'http://entry');
-  } catch {
-    return new URL('/', 'http://entry');
-  }
+/** Split a request target into path and query without a URL parse (every request pays this). */
+function splitTarget(req: IncomingMessage): { path: string; query: URLSearchParams | null } {
+  const raw = req.url ?? '/';
+  const mark = raw.indexOf('?');
+  if (mark === -1) return { path: raw, query: null };
+  return { path: raw.slice(0, mark), query: new URLSearchParams(raw.slice(mark + 1)) };
 }
 
 async function readBody(req: IncomingMessage): Promise<Buffer> {
@@ -60,8 +66,7 @@ const GIT_PATH = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-rece
 
 async function dispatch(store: Store, req: IncomingMessage): Promise<Reply> {
   const method = req.method ?? 'GET';
-  const url = urlOf(req);
-  const path = url.pathname;
+  const { path, query } = splitTarget(req);
 
   if (method === 'GET' && path === '/healthz') return jsonReply(200, { ok: true });
 
@@ -79,7 +84,7 @@ async function dispatch(store: Store, req: IncomingMessage): Promise<Reply> {
   }
   if (path === '/api/v3' || path.startsWith('/api/v3/')) {
     const body = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readBody(req);
-    return handleRest(store, method, path, url.searchParams, body);
+    return handleRest(store, method, path, query ?? new URLSearchParams(), body);
   }
   const gitMatch = GIT_PATH.exec(path);
   if (gitMatch !== null) {
@@ -91,7 +96,7 @@ async function dispatch(store: Store, req: IncomingMessage): Promise<Reply> {
       decodeURIComponent(gitMatch[1]),
       decodeURIComponent(gitMatch[2]),
       gitMatch[3],
-      url.searchParams,
+      query ?? new URLSearchParams(),
       body,
       typeof protocol === 'string' ? protocol : undefined,
     );

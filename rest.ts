@@ -218,6 +218,25 @@ function issueJson(store: Store, repo: RepoRec, issue: IssueRec): Json {
   };
 }
 
+/**
+ * Serialised issue bodies, cached per record. The read workload asks for one issue
+ * thousands of times, so the JSON is rebuilt only when a cheap fingerprint of everything
+ * issueJson serialises — state, title, body, labels, comments count, updatedAt — changes.
+ * The fingerprint keeps the cache honest no matter which surface mutated the record
+ * (REST PATCH, a comment, or GraphQL's closeIssue all move at least one fingerprinted
+ * field), without enumerating the writers.
+ */
+const issueBodyCache = new WeakMap<IssueRec, { fingerprint: string; body: string }>();
+
+function issueReply(status: number, store: Store, repo: RepoRec, issue: IssueRec): Reply {
+  const fingerprint = `${issue.state}|${issue.updatedAt}|${issue.comments.length}|${issue.title}|${issue.body}|${issue.labels.join(',')}`;
+  const cached = issueBodyCache.get(issue);
+  if (cached !== undefined && cached.fingerprint === fingerprint) return { status, body: cached.body };
+  const body = `${JSON.stringify(issueJson(store, repo, issue))}\n`;
+  issueBodyCache.set(issue, { fingerprint, body });
+  return { status, body };
+}
+
 function commentJson(store: Store, repo: RepoRec, issueNumber: number, comment: CommentRec): Json {
   return {
     id: comment.id,
@@ -703,7 +722,7 @@ function createIssue(store: Store, repo: RepoRec, body: Json): Reply {
   repo.nextNumber += 1;
   store.nextIssueDbId += 1;
   repo.issues.set(issue.number, issue);
-  return jsonReply(201, issueJson(store, repo, issue));
+  return issueReply(201, store, repo, issue);
 }
 
 function listIssues(store: Store, repo: RepoRec, query: URLSearchParams): Reply {
@@ -735,7 +754,7 @@ function patchIssue(store: Store, repo: RepoRec, issue: IssueRec, body: Json): R
     issue.labels = [...labelNames];
   }
   issue.updatedAt = tick(store).iso;
-  return jsonReply(200, issueJson(store, repo, issue));
+  return issueReply(200, store, repo, issue);
 }
 
 /** The issue or pull request a comments route addresses (GitHub serves PR comments here too). */
@@ -981,7 +1000,7 @@ function repoRoute(
     if (rest.length === 1) {
       const issue = repo.issues.get(number);
       if (issue === undefined) return notFound();
-      if (method === 'GET') return jsonReply(200, issueJson(store, repo, issue));
+      if (method === 'GET') return issueReply(200, store, repo, issue);
       if (method === 'PATCH') return patchIssue(store, repo, issue, body);
       return notFound();
     }
