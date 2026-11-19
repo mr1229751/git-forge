@@ -5,6 +5,7 @@
 // sectioned v2 fetch answers, and per-ref ok/ng lines whose non-fast-forward reason is the
 // exact string the checks compare. Pure functions of the store: no clocks, no randomness.
 
+import { createHash } from 'node:crypto';
 import { getRepo, type RepoRec, type Store } from './store.ts';
 import {
   ZERO_OID,
@@ -12,11 +13,12 @@ import {
   collectReachable,
   commitClosure,
   isAncestor,
-  parseCommit,
+  parseCommitCached,
   parsePack,
   parseTag,
-  parseTree,
+  parseTreeCached,
   peelToCommit,
+  type CommitInfo,
 } from './gitobj.ts';
 
 export interface Reply {
@@ -229,7 +231,7 @@ function addTreeClosure(repo: RepoRec, treeOid: string, into: Set<string>): void
     if (object === undefined) continue;
     into.add(oid);
     if (object.type === 'tree') {
-      for (const entry of parseTree(object.data)) stack.push(entry.oid);
+      for (const entry of parseTreeCached(repo, oid) ?? []) stack.push(entry.oid);
     }
   }
 }
@@ -270,7 +272,7 @@ function planFetch(
     if (shallowSet.has(have) && object.type === 'commit') {
       heldCommits.add(have);
       heldObjects.add(have);
-      addTreeClosure(repo, parseCommit(object.data).tree, heldObjects);
+      addTreeClosure(repo, (parseCommitCached(repo, have) as CommitInfo).tree, heldObjects);
     } else {
       for (const oid of collectReachable(repo, [have])) heldObjects.add(oid);
       const commit = peelToCommit(repo, have);
@@ -289,12 +291,17 @@ function planFetch(
       queue.push(commit);
     }
   }
+  // With a depth limit and no client shallow lines, generations past the limit feed no
+  // decision (the send filter drops them, and unshallow bookkeeping needs a shallow set),
+  // so the walk stops there — a depth-1 clone then numbers two generations, not the history.
+  const capGenerations = depth !== null && shallowSet.size === 0;
   for (let index = 0; index < queue.length; index += 1) {
     const oid = queue[index];
     const object = repo.objects.get(oid);
     if (object === undefined || object.type !== 'commit') continue;
     const next = (generation.get(oid) as number) + 1;
-    for (const parent of parseCommit(object.data).parents) {
+    if (capGenerations && next > (depth as number)) continue;
+    for (const parent of (parseCommitCached(repo, oid) as CommitInfo).parents) {
       if (!generation.has(parent)) {
         generation.set(parent, next);
         queue.push(parent);
@@ -323,7 +330,7 @@ function planFetch(
     objects.add(oid);
     const object = repo.objects.get(oid);
     if (object !== undefined && object.type === 'commit') {
-      addTreeClosure(repo, parseCommit(object.data).tree, objects);
+      addTreeClosure(repo, (parseCommitCached(repo, oid) as CommitInfo).tree, objects);
     }
   }
   // Nothing the client already holds is re-sent (a shared blob stays out even when a sent
@@ -338,7 +345,7 @@ function planFetch(
     for (const oid of sendCommits) {
       const object = repo.objects.get(oid);
       if (object === undefined || object.type !== 'commit') continue;
-      if (parseCommit(object.data).parents.some((parent) => !available.has(parent))) boundary.push(oid);
+      if ((parseCommitCached(repo, oid) as CommitInfo).parents.some((parent) => !available.has(parent))) boundary.push(oid);
     }
   }
   const unshallow: string[] = [];
@@ -346,7 +353,7 @@ function planFetch(
     if (!generation.has(oid)) continue;
     const object = repo.objects.get(oid);
     if (object === undefined || object.type !== 'commit') continue;
-    if (parseCommit(object.data).parents.every((parent) => available.has(parent))) unshallow.push(oid);
+    if ((parseCommitCached(repo, oid) as CommitInfo).parents.every((parent) => available.has(parent))) unshallow.push(oid);
   }
   return { objects, boundary: boundary.sort(), unshallow: unshallow.sort(), commonHaves };
 }
@@ -405,10 +412,33 @@ function parseV2Request(body: Buffer): { command: string; args: string[] } | nul
   return command === null ? null : { command, args };
 }
 
+/**
+ * Pack cache: git objects are content-addressed and immutable, so a pack built for one exact
+ * object set is valid forever. The clone workload asks for the same set dozens of times
+ * concurrently; building it once turns the rest into memory reads. Keyed by the sha1 of the
+ * sorted object ids, capped, FIFO-evicted.
+ */
+const packCache = new Map<string, Buffer>();
+const PACK_CACHE_MAX = 128;
+
+function packFor(repo: RepoRec, objects: ReadonlySet<string>): Buffer {
+  const sorted = [...objects].sort();
+  const key = createHash('sha1').update(sorted.join(' ')).digest('hex');
+  const cached = packCache.get(key);
+  if (cached !== undefined) return cached;
+  const pack = buildPack(repo, sorted);
+  if (packCache.size >= PACK_CACHE_MAX) {
+    const oldest = packCache.keys().next().value;
+    if (oldest !== undefined) packCache.delete(oldest);
+  }
+  packCache.set(key, pack);
+  return pack;
+}
+
 function fetchReplyV2(repo: RepoRec, argLines: readonly string[]): Reply {
   const args = fetchArgsFromLines(argLines);
   const plan = planFetch(repo, args.wants, args.haves, args.shallowLines, args.depth);
-  const pack = buildPack(repo, [...plan.objects].sort());
+  const pack = packFor(repo, plan.objects);
   const parts: Buffer[] = [pkt('acknowledgments\n')];
   if (plan.commonHaves.length > 0) {
     for (const have of plan.commonHaves) parts.push(pkt(`ACK ${have}\n`));
@@ -437,7 +467,7 @@ function fetchReplyV0(repo: RepoRec, body: Buffer): Reply {
     .map((packet) => lineOf(packet));
   const args = fetchArgsFromLines(lines);
   const plan = planFetch(repo, args.wants, args.haves, args.shallowLines, args.depth);
-  const pack = buildPack(repo, [...plan.objects].sort());
+  const pack = packFor(repo, plan.objects);
   const parts: Buffer[] = [];
   for (const oid of plan.boundary) parts.push(pkt(`shallow ${oid}\n`));
   for (const oid of plan.unshallow) parts.push(pkt(`unshallow ${oid}\n`));

@@ -68,6 +68,44 @@ export interface CommitInfo {
   message: string;
 }
 
+/**
+ * Parsed-object caches: git objects are immutable and content-addressed, so a parse of one
+ * oid is valid for the life of its repository. Ancestor walks and fetch planning re-parse
+ * the same commits hundreds of times without this; with it they become map reads.
+ */
+const commitParseCache = new WeakMap<RepoRec, Map<string, CommitInfo>>();
+const treeParseCache = new WeakMap<RepoRec, Map<string, TreeEntry[]>>();
+
+export function parseCommitCached(repo: RepoRec, oid: string): CommitInfo | null {
+  let perRepo = commitParseCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map();
+    commitParseCache.set(repo, perRepo);
+  }
+  const hit = perRepo.get(oid);
+  if (hit !== undefined) return hit;
+  const object = repo.objects.get(oid);
+  if (object === undefined || object.type !== 'commit') return null;
+  const parsed = parseCommit(object.data);
+  perRepo.set(oid, parsed);
+  return parsed;
+}
+
+export function parseTreeCached(repo: RepoRec, oid: string): TreeEntry[] | null {
+  let perRepo = treeParseCache.get(repo);
+  if (perRepo === undefined) {
+    perRepo = new Map();
+    treeParseCache.set(repo, perRepo);
+  }
+  const hit = perRepo.get(oid);
+  if (hit !== undefined) return hit;
+  const object = repo.objects.get(oid);
+  if (object === undefined || object.type !== 'tree') return null;
+  const parsed = parseTree(object.data);
+  perRepo.set(oid, parsed);
+  return parsed;
+}
+
 export function parseCommit(data: Buffer): CommitInfo {
   const text = data.toString('utf8');
   const split = text.indexOf('\n\n');
@@ -148,11 +186,11 @@ export function collectReachable(
     if (object === undefined) continue;
     seen.add(oid);
     if (object.type === 'commit') {
-      const commit = parseCommit(object.data);
+      const commit = parseCommitCached(repo, oid) as CommitInfo;
       stack.push(commit.tree);
       for (const parent of commit.parents) stack.push(parent);
     } else if (object.type === 'tree') {
-      for (const entry of parseTree(object.data)) stack.push(entry.oid);
+      for (const entry of parseTreeCached(repo, oid) as TreeEntry[]) stack.push(entry.oid);
     } else if (object.type === 'tag') {
       stack.push(parseTag(object.data).object);
     }
@@ -167,10 +205,10 @@ export function commitClosure(repo: RepoRec, tip: string): Set<string> {
   while (stack.length > 0) {
     const oid = stack.pop() as string;
     if (seen.has(oid)) continue;
-    const object = repo.objects.get(oid);
-    if (object === undefined || object.type !== 'commit') continue;
+    const commit = parseCommitCached(repo, oid);
+    if (commit === null) continue;
     seen.add(oid);
-    for (const parent of parseCommit(object.data).parents) stack.push(parent);
+    for (const parent of commit.parents) stack.push(parent);
   }
   return seen;
 }
@@ -188,11 +226,11 @@ export function commitsBetween(repo: RepoRec, tip: string, stops: ReadonlySet<st
   while (stack.length > 0) {
     const oid = stack.pop() as string;
     if (seen.has(oid) || stops.has(oid)) continue;
-    const object = repo.objects.get(oid);
-    if (object === undefined || object.type !== 'commit') continue;
+    const commit = parseCommitCached(repo, oid);
+    if (commit === null) continue;
     seen.add(oid);
     out.push(oid);
-    for (const parent of parseCommit(object.data).parents) stack.push(parent);
+    for (const parent of commit.parents) stack.push(parent);
   }
   return out;
 }
@@ -201,9 +239,9 @@ export function commitsBetween(repo: RepoRec, tip: string, stops: ReadonlySet<st
 export function treeGet(repo: RepoRec, treeOid: string, segments: readonly string[]): string | null {
   let current = treeOid;
   for (let depth = 0; depth < segments.length; depth += 1) {
-    const object = repo.objects.get(current);
-    if (object === undefined || object.type !== 'tree') return null;
-    const entry = parseTree(object.data).find((candidate) => candidate.name === segments[depth]);
+    const entries = parseTreeCached(repo, current);
+    if (entries === null) return null;
+    const entry = entries.find((candidate) => candidate.name === segments[depth]);
     if (entry === undefined) return null;
     if (depth === segments.length - 1) return entry.mode === '40000' ? null : entry.oid;
     if (entry.mode !== '40000') return null;
@@ -236,9 +274,9 @@ export function treeSet(
 /** A path -> blob oid snapshot of a whole tree (for merges and comparisons). */
 export function flattenTree(repo: RepoRec, treeOid: string, prefix = ''): Map<string, { oid: string; mode: string }> {
   const out = new Map<string, { oid: string; mode: string }>();
-  const object = repo.objects.get(treeOid);
-  if (object === undefined || object.type !== 'tree') return out;
-  for (const entry of parseTree(object.data)) {
+  const entries = parseTreeCached(repo, treeOid);
+  if (entries === null) return out;
+  for (const entry of entries) {
     const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
     if (entry.mode === '40000') {
       for (const [childPath, child] of flattenTree(repo, entry.oid, path)) out.set(childPath, child);
@@ -377,11 +415,24 @@ export interface ParsedPack {
  */
 function inflateOne(pack: Buffer, offset: number): { data: Buffer; length: number } {
   const rest = pack.length - offset;
+  // Exponential probes bracket the stream's end quickly for the small objects packs carry,
+  // then a binary search inside the bracket pins it exactly; the winning probe's own
+  // inflation is the data, so nothing is inflated twice.
   let lo = 1;
   let hi = rest;
+  let probe = 16;
   let data: Buffer | null = null;
-  // First confirm the whole remainder inflates (it must: later objects are trailing bytes).
-  data = inflateSync(pack.subarray(offset));
+  while (probe < rest) {
+    try {
+      data = inflateSync(pack.subarray(offset, offset + probe));
+      hi = probe;
+      break;
+    } catch {
+      lo = probe + 1;
+      probe *= 4;
+    }
+  }
+  if (data === null) data = inflateSync(pack.subarray(offset));
   while (lo < hi) {
     const mid = (lo + hi) >> 1;
     try {
